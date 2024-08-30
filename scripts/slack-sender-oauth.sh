@@ -5,13 +5,13 @@
 #
 # How to use:
 #   Export the following variables or pass them as parameters.
-#   $ ./slack_sender.sh \
+#   $ ./slack-sender-oauth.sh \
 #       <SLACK_APP_OAUTH_TOKEN> \
 #       <SLACK_CHANNEL_ID> \
 #       <SLACK_MESSAGE_MARKDOWN>
 #
 # Example:
-#   $ ./slack_sender.sh \
+#   $ ./slack-sender-oauth.sh \
 #       xoxb-not-a-real-token-this-will-not-work \
 #       C05FSAP0RM0 \
 #       '👾 Hi, I am a bot that can post *_fancy_* messages to any public channel.'
