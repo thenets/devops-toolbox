@@ -8,23 +8,28 @@
 #   $ ./github-release-downloader.sh \
 #       <GITHUB_ORG> \
 #       <GITHUB_REPO> \
-#       <SEARCH_PATTERN>
+#       <SEARCH_PATTERN> \
+#       <OUTPUT_FILE_PATH (optional)>
 #
 # Example:
 #   $ ./github-release-downloader.sh \
 #       gohugoio \
 #       hugo \
-#       "_linux-amd64.tar.gz"
+#       "_linux-amd64.tar.gz" \
+#       ./hugo.tar.gz
 #
 # Inspired by:
 #   https://gist.github.com/umohi/bfc7ad9a845fc10289c03d532e3d2c2f
 
 # START
 
-# Parameters
+# Parameters (required)
 declare -r GITHUB_ORG=${GITHUB_ORG:-$1}
 declare -r GITHUB_REPO=${GITHUB_REPO:-$2}
 declare -r SEARCH_PATTERN=${SEARCH_PATTERN:-$3}
+
+# Parameters (optional)
+declare OUTPUT_FILE_PATH=${OUTPUT_FILE_PATH:-$4}
 
 # Helpers
 if [ -z "$TERM" ] || [ "$TERM" == "dumb" ]; then
@@ -195,18 +200,19 @@ declare ASSET
 # Main
 function main() {
     log_info "Parameters:"
-    log_info "   GITHUB_ORG     : ${GITHUB_ORG}"
-    log_info "   GITHUB_REPO    : ${GITHUB_REPO}"
-    log_info "   SEARCH_PATTERN : ${SEARCH_PATTERN}"
-
-    # TODO check deps, like curl and jq
+    log_info "   GITHUB_ORG       : ${GITHUB_ORG}"
+    log_info "   GITHUB_REPO      : ${GITHUB_REPO}"
+    log_info "   SEARCH_PATTERN   : ${SEARCH_PATTERN}"
+    log_info "   OUTPUT_FILE_PATH : ${OUTPUT_FILE_PATH}"
 
     # Retrieve
     get_latest_release
     get_release_assets ${RELEASE_LATEST_NAME}
     search_asset_by_name ${SEARCH_PATTERN}
 
-    declare -r OUTPUT_FILE_PATH="$(pwd)/${ASSET_NAME}"
+    if [[ "${OUTPUT_FILE_PATH}" == "" ]]; then
+        OUTPUT_FILE_PATH="$(pwd)/${ASSET_NAME}"
+    fi
 
     # Download
     if [[ -f "${OUTPUT_FILE_PATH}" ]]; then
@@ -215,7 +221,7 @@ function main() {
         exit 0
     fi
     log_info "Downloading..."
-    h_run "curl --progress-bar -o ${OUTPUT_FILE_PATH} ${ASSET_URL}"
+    h_run "curl -SL --progress-bar -o ${OUTPUT_FILE_PATH} ${ASSET_URL}"
     log_success "Saved on: ${OUTPUT_FILE_PATH}"
 }
 
