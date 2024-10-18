@@ -22,6 +22,11 @@ log_warning() {
     local NC=$(tput sgr0)
     echo "${YELLOW}[WARNING]${NC} $*" 1>&2
 }
+log_debug() {
+    local PURPLE=$(tput setaf 5)
+    local NC=$(tput sgr0)
+    echo "${PURPLE}[DEBUG  ]${NC} $*" 1>&2
+}
 log_error() {
     local RED=$(tput setaf 1)
     local NC=$(tput sgr0)
