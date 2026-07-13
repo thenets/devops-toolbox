@@ -1,0 +1,4 @@
+interface:
+  display_name: "Bash Script Writer"
+  short_description: "Create safe, maintainable Bash scripts"
+  default_prompt: "Use $write-bash-scripts to create a robust Bash script for this task."
