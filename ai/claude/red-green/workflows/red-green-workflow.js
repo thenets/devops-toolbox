@@ -1,13 +1,14 @@
 export const meta = {
   name: 'red-green-workflow',
-  description: 'Multi-agent red-green bug fix: parallel investigation, adversarially verified diagnosis, red test, fix, green verification, review',
+  description: 'Multi-agent red-green bug fix: parallel investigation, adversarially verified diagnosis, red test, fix, green verification, validation panel via Cursor agent CLI (Opus + GPT + Grok — workflow path is always complex) with evaluation ledger and consensus-gap remediation loop',
   whenToUse: 'Complex bugs — unknown root cause, multiple symptoms, cross-component failures, races. Simple bugs: fix inline with the red-green skill instead.',
   phases: [
     { title: 'Investigate', detail: 'parallel evidence gathering: code, history, live system, test harness' },
     { title: 'Diagnose', detail: 'independent hypotheses, adversarially refuted' },
     { title: 'Red', detail: 'failing regression test, verified to fail for the predicted reason' },
     { title: 'Fix', detail: 'minimal root-cause fix, product code only' },
-    { title: 'Green', detail: 'test + suite pass, adversarial review' },
+    { title: 'Green', detail: 'test + suite pass' },
+    { title: 'AdversaryReview', detail: 'Opus + GPT + Grok panel; evaluate ledger; remediate accepted findings / consensus gaps' },
   ],
 }
 
@@ -30,7 +31,12 @@ const REDGREEN_RULES = `Red-green rules (non-negotiable):
 - A red is only a red when the test FAILS with the assertion you predicted BEFORE running it. A passing test, a compile/build error, or a setup crash is NOT a red.
 - Fix product code only; never edit a test to make it pass.
 - Name tests after the bug, assert behavior not implementation, use the cheapest tier (unit before integration) that can actually fail on this bug.
-${scriptsDir ? `- Verify runs with the helper scripts: '${scriptsDir}/run_red.sh -p <predicted-failure-regex> -- <cmd>' and '${scriptsDir}/run_green.sh -- <cmd>'.` : ''}`
+- After green, a validation panel via Cursor agent CLI runs only when \`agent\` is present and authenticated (\`check_agent_cli.sh\`). If the gate fails, skip steps 6–8 and note the skip — do not enter remediation.
+- This workflow path is always Complex: yes → always pass \`--with-grok\` (Opus + GPT + Grok).
+- When the gate passes: run the panel, then EVALUATE findings (accept/reject/needs-evidence with evidence cites). Skill-done only when raw panel pass AND zero accepted findings AND no material consensus gap.
+- Remediate (step 8) only on accepted findings or material consensus gaps (ok split / material reworkStep split). Nits alone do not loop.
+${scriptsDir ? `- Verify runs with the helper scripts: '${scriptsDir}/run_red.sh -p <predicted-failure-regex> -- <cmd>' and '${scriptsDir}/run_green.sh -- <cmd>'.
+- CLI gate: '${scriptsDir}/check_agent_cli.sh'. Validation panel: '${scriptsDir}/run_adversary_review.sh --workspace ${repo} --context-file <worksheet.md> --with-grok' (exit 3 = skipped).` : '- Validation panel: run Cursor `agent` CLI with Opus + GPT + Grok in ask mode only if authenticated (see red-green skill references/validation-panel.md).'}`
 
 // ---- schemas ---------------------------------------------------------------
 const EVIDENCE = {
@@ -81,9 +87,31 @@ const GREEN_RESULT = {
     failures: { type: 'string', description: 'if anything failed: exact test names + assertions' },
   },
 }
-const REVIEW = {
-  type: 'object', required: ['ok', 'findings'],
-  properties: { ok: { type: 'boolean' }, findings: { type: 'array', items: { type: 'string' } } },
+const ADVERSARY_RESULT = {
+  type: 'object', required: ['ok', 'skillDone', 'findings', 'acceptedFindings', 'models', 'reworkStep', 'aggregatePath', 'rounds'],
+  properties: {
+    ok: { type: 'boolean', description: 'raw panel pass (all panelists ok=true)' },
+    skillDone: { type: 'boolean', description: 'raw pass + zero accepted findings + no material consensus gap' },
+    findings: { type: 'array', items: { type: 'string' }, description: 'raw panel findings' },
+    acceptedFindings: { type: 'array', items: { type: 'string' }, description: 'findings accepted after evaluation' },
+    rejectedFindings: { type: 'array', items: { type: 'string' } },
+    consensusGaps: { type: 'array', items: { type: 'string' }, description: 'material ok/reworkStep splits after dedupe' },
+    models: { type: 'object', properties: { opus: { type: 'string' }, gpt: { type: 'string' }, grok: { type: 'string' } } },
+    reworkStep: { type: ['integer', 'null'], description: 'earliest 1=repro 2=live 3=red 4=fix 5=green among accepted/gaps; null if skillDone' },
+    aggregatePath: { type: 'string' },
+    rounds: { type: 'integer' },
+    notes: { type: 'string' },
+  },
+}
+const REMEDIATION = {
+  type: 'object', required: ['reworkStep', 'filesChanged', 'description', 'red', 'green'],
+  properties: {
+    reworkStep: { type: 'integer' },
+    filesChanged: { type: 'array', items: { type: 'string' } },
+    description: { type: 'string' },
+    red: RED_RESULT,
+    green: GREEN_RESULT,
+  },
 }
 
 // ---- Phase 1: Investigate ---------------------------------------------------
@@ -191,7 +219,7 @@ if (!red || (!red.isRed && red.mode !== 'surgical-revert')) {
 
 // ---- Phase 4: Fix ------------------------------------------------------------------
 phase('Fix')
-const fix = await agent(
+let fix = await agent(
   `${CTX}\n\nDiagnosed root cause: ${diagnosis.rootCause} at ${diagnosis.location}. Mechanism: ${diagnosis.mechanism}\nRed test: files ${JSON.stringify(red.testFiles)}, command: ${red.testCommand}, mode: ${red.mode}\n\n${REDGREEN_RULES}\n\nImplement the MINIMAL fix for the root cause. Product code only — do not touch the test files. Do not refactor beyond the fix. Match the surrounding code's style.${red.mode === 'surgical-revert' ? `\n\nThis is surgical-revert mode: after fixing and going green, verify the red by surgically reverting the BEHAVIOR (keep the tree compiling: flip a condition, not delete the function), predicting the exact failure set, running, requiring an exact match, then restoring and re-running green. Record predicted vs observed in your result description.` : ''}`,
   { label: 'fix', phase: 'Fix', schema: FIX_RESULT },
 )
@@ -208,32 +236,167 @@ for (let attempt = 0; attempt < 3; attempt++) {
   if (green && green.redTestPasses && green.suitePasses) break
   if (attempt === 2) break
   log(`Not green yet: ${green ? green.failures || 'runner failed' : 'runner failed'} — repairing`)
-  await agent(
+  const repaired = await agent(
     `${CTX}\n\nRoot cause: ${diagnosis.rootCause}. Fix so far changed: ${JSON.stringify(fix.filesChanged)}.\nGreen verification failed:\n${green ? green.output : '(runner produced no output)'}\nFailures: ${green ? green.failures || '' : ''}\n\n${REDGREEN_RULES}\n\nRepair the FIX (product code only — never the tests) so both the regression test and the full suite pass. If a suite failure reveals the fix is wrong rather than incomplete, say so plainly in your description instead of forcing it.`,
     { label: `fix:repair#${attempt + 1}`, phase: 'Green', schema: FIX_RESULT },
   )
+  if (repaired) fix = repaired
 }
 
-// Independent quality review, two lenses in parallel (both read-only).
-const reviews = (await parallel([
-  () => agent(
-    `${CTX}\n\nReview the new regression TEST for this fix: files ${JSON.stringify(red.testFiles)} (root cause was: ${diagnosis.rootCause}). Lens: test quality. Does it assert behavior (not implementation)? Is it named after the bug? Would it survive a reasonable refactor of the fix? Is every wait bounded (no possible hang)? Would it really catch the bug's return? findings = concrete problems only. Do NOT modify any file.`,
-    { label: 'review:test', phase: 'Green', schema: REVIEW },
-  ),
-  () => agent(
-    `${CTX}\n\nReview the FIX: files ${JSON.stringify(fix.filesChanged)} (diagnosis: ${diagnosis.rootCause}; mechanism: ${diagnosis.mechanism}). Lens: fix quality. Does it address the root cause or mask the symptom? Could it regress adjacent behavior (read the call sites)? Is it minimal? findings = concrete problems only. Do NOT modify any file.`,
-    { label: 'review:fix', phase: 'Green', schema: REVIEW },
-  ),
-])).filter(Boolean)
-
 const isGreen = !!(green && green.redTestPasses && green.suitePasses)
+if (!isGreen) {
+  return {
+    status: 'red-fix-not-green',
+    reproduction: { live: !!live, steps: live ? live.reproSteps : '(not reproduced live — see evidence)' },
+    diagnosis: { rootCause: diagnosis.rootCause, location: diagnosis.location, mechanism: diagnosis.mechanism, lens: winner.lens },
+    red: { mode: red.mode || 'test-first', testFiles: red.testFiles, testCommand: red.testCommand, predictedFailure: red.predictedFailure, observedFailure: red.observedFailure },
+    fix: { filesChanged: fix.filesChanged, description: fix.description },
+    green: green || { redTestPasses: false, suitePasses: false, output: 'green runner failed' },
+    adversary: null,
+    caveats: ['Green verification did NOT fully pass — do not present this as a verified fix. Skipped validation panel.'],
+  }
+}
+
+// ---- Phase 6–8: Validation panel + evaluate + consensus-gap remediation ---------------
+phase('AdversaryReview')
+
+// Gate: only run steps 6–8 when Cursor agent CLI is present + authenticated.
+const cliGate = await agent(
+  `${CTX}\n\nBefore the validation panel, run the CLI gate${scriptsDir ? `:\n  ${scriptsDir}/check_agent_cli.sh\n` : ' (command -v agent && agent status --format json; require isAuthenticated=true).'}\nReport whether the Cursor agent CLI is present and authenticated.\nReturn ok=true and skillDone=true only if the gate passed. If skipped, put the reason in findings[0], set skillDone=false, acceptedFindings=[], reworkStep=null, models={}, aggregatePath='', rounds=0, notes='skipped-cli-gate'. Do NOT invent a substitute review. Do NOT modify files.`,
+  { label: 'adversary:cli-gate', phase: 'AdversaryReview', schema: ADVERSARY_RESULT },
+)
+
+let adversary = null
+const remediationLog = []
+
+if (!cliGate || !cliGate.ok) {
+  const reason = (cliGate && cliGate.findings && cliGate.findings[0]) || 'Cursor agent CLI missing or not authenticated'
+  log(`Validation panel SKIPPED (CLI gate): ${reason}`)
+  adversary = {
+    ok: true, // not a rejection — skipped by design
+    skillDone: true, // steps 1–5 are definition of done when skipped
+    findings: [],
+    acceptedFindings: [],
+    rejectedFindings: [],
+    consensusGaps: [],
+    models: {},
+    reworkStep: null,
+    aggregatePath: '',
+    rounds: 0,
+    notes: `skipped-cli-gate: ${reason}`,
+  }
+} else {
+  log('CLI gate passed — running validation panel (Opus + GPT + Grok; workflow path is always complex)')
+
+  for (let round = 1; round <= 3; round++) {
+    adversary = await agent(
+      `${CTX}\n\n${REDGREEN_RULES}\n\nThe red-green work so far:
+- Complex: yes (workflow path) — always use --with-grok
+- Diagnosis: ${diagnosis.rootCause} at ${diagnosis.location}
+- Mechanism: ${diagnosis.mechanism}
+- Red: files ${JSON.stringify(red.testFiles)}, command: ${red.testCommand}
+  predicted: ${red.predictedFailure}
+  observed: ${red.observedFailure}
+- Fix: ${JSON.stringify(fix.filesChanged)} — ${fix.description}
+- Green: redTestPasses=${green.redTestPasses}, suitePasses=${green.suitePasses}, suiteCommand=${green.suiteCommand}
+  output excerpt: ${green.output}
+
+Step 6: write a context markdown under /tmp (include Complex: yes), then run the validation panel${scriptsDir ? `:\n  ${scriptsDir}/run_adversary_review.sh --workspace ${repo} --context-file <that-file> --with-grok\n` : ' (see red-green skill references/validation-panel.md). '}
+If the script exits 3, treat as SKIPPED — set ok=true, skillDone=true, notes='skipped-cli-gate', findings=[], acceptedFindings=[].
+
+Step 7 (mandatory when panel ran): evaluate AGGREGATE.json against the worksheet/repo. Dedupe findings; for each verdict accept/reject/needs-evidence (reject MUST cite path/hunk/command). List material consensus gaps (ok_split or reworkStep_split on accepted/needs-evidence). Nits alone are not material.
+
+Set:
+- ok = raw panel pass (all panelists ok=true)
+- acceptedFindings / rejectedFindings / consensusGaps from your evaluation
+- skillDone = ok AND acceptedFindings empty AND consensusGaps empty
+- reworkStep = earliest among accepted/material gaps (1-5) or null if skillDone
+- models (incl. grok), aggregatePath, rounds=${round}
+Do NOT modify repo source during the review itself.`,
+      { label: `adversary:run#${round}`, phase: 'AdversaryReview', schema: ADVERSARY_RESULT },
+    )
+    if (!adversary) {
+      log(`Validation panel round ${round}: runner failed`)
+      continue
+    }
+    if (adversary.notes && String(adversary.notes).includes('skipped-cli-gate')) {
+      log(`Validation panel SKIPPED mid-run: ${adversary.notes}`)
+      break
+    }
+    if (adversary.skillDone) {
+      const m = adversary.models || {}
+      log(`Validation panel skill-done on round ${round} (opus=${m.opus} gpt=${m.gpt} grok=${m.grok || 'n/a'})`)
+      break
+    }
+
+    // Step 8 — remediate only on accepted findings / material consensus gaps (not CLI skip, not nits alone).
+    const step = adversary.reworkStep || 4
+    const accepted = adversary.acceptedFindings || []
+    const gaps = adversary.consensusGaps || []
+    log(`Validation panel needs remediations round ${round}: reworkStep=${step}. Accepted: ${accepted.join('; ') || '(none)'}. Gaps: ${gaps.join('; ') || '(none)'}`)
+
+    const rem = await agent(
+      `${CTX}\n\n${REDGREEN_RULES}\n\nValidation evaluation requires remediations (round ${round}).
+reworkStep=${step} (1=repro 2=live 3=red 4=fix 5=green).
+Accepted findings:\n${accepted.map(f => `- ${f}`).join('\n') || '(none)'}
+Material consensus gaps:\n${gaps.map(f => `- ${f}`).join('\n') || '(none)'}
+Raw findings (for context):\n${(adversary.findings || []).map(f => `- ${f}`).join('\n')}
+Current diagnosis: ${diagnosis.rootCause} at ${diagnosis.location}
+Current red: ${JSON.stringify(red.testFiles)} / ${red.testCommand}
+Current fix: ${JSON.stringify(fix.filesChanged)}
+
+Investigate the accepted findings / gaps only (do not chase rejected nits). Return to step ${step} and redo work FORWARD through green:
+- If step≤2: re-establish reproduction/live evidence (you may add logging scratch only if essential; prefer product/test evidence). Update description with what you learned.
+- If step=3: strengthen/replace the RED test; verify with run_red.sh (predict failure first). Do NOT weaken assertions. Then re-apply/confirm the fix still makes sense and re-check green.
+- If step=4: fix PRODUCT code only; never edit the test to make it pass. Then re-check green.
+- If step=5: re-run green gates; if tests fail, repair product code.
+Return the reworkStep you actually executed, filesChanged, description, and the resulting red+green verification objects.`,
+      { label: `adversary:remediate#${round}`, phase: 'AdversaryReview', schema: REMEDIATION },
+    )
+    if (rem) {
+      remediationLog.push({
+        round,
+        reworkStep: rem.reworkStep,
+        description: rem.description,
+        filesChanged: rem.filesChanged,
+        acceptedFindings: accepted,
+        consensusGaps: gaps,
+      })
+      if (rem.filesChanged && rem.filesChanged.length) {
+        fix = { filesChanged: Array.from(new Set([...(fix.filesChanged || []), ...rem.filesChanged])), description: `${fix.description}\n[remediation r${round}] ${rem.description}` }
+      }
+      if (rem.red && (rem.reworkStep <= 3)) red = rem.red
+      if (rem.green) green = rem.green
+    }
+  }
+}
+
+const skippedCli = !!(adversary && adversary.notes && String(adversary.notes).includes('skipped-cli-gate'))
+const skillDone = !!(adversary && adversary.skillDone)
 return {
-  status: isGreen ? 'green' : 'red-fix-not-green',
+  status: skippedCli ? 'green-adversary-skipped' : (skillDone ? 'green' : 'adversary-rejected'),
   reproduction: { live: !!live, steps: live ? live.reproSteps : '(not reproduced live — see evidence)' },
+  complex: true,
   diagnosis: { rootCause: diagnosis.rootCause, location: diagnosis.location, mechanism: diagnosis.mechanism, lens: winner.lens },
   red: { mode: red.mode || 'test-first', testFiles: red.testFiles, testCommand: red.testCommand, predictedFailure: red.predictedFailure, observedFailure: red.observedFailure },
   fix: { filesChanged: fix.filesChanged, description: fix.description },
   green: green || { redTestPasses: false, suitePasses: false, output: 'green runner failed' },
-  reviewFindings: reviews.flatMap(r => r.findings || []),
-  caveats: isGreen ? [] : ['Green verification did NOT fully pass — do not present this as a verified fix.'],
+  adversary: adversary || {
+    ok: false,
+    skillDone: false,
+    findings: ['validation panel runner produced no result'],
+    acceptedFindings: [],
+    models: {},
+    reworkStep: 5,
+    aggregatePath: '',
+    rounds: 0,
+  },
+  remediationLog,
+  caveats: skippedCli
+    ? [`Validation panel skipped: ${(adversary && adversary.notes) || 'Cursor agent CLI missing or not authenticated'}. Steps 1–5 completed; steps 7–8 were not entered.`]
+    : (skillDone ? [] : [
+      'Validation panel did NOT reach skill-done after remediation attempts — do not present this as a verified fix.',
+      ...((adversary && adversary.acceptedFindings) || []),
+      ...((adversary && adversary.consensusGaps) || []),
+    ]),
 }
